@@ -1,6 +1,7 @@
 require 'rest-client'
 require 'json'
 require 'base64'
+require 'active_support/hash_with_indifferent_access'
 
 # Client interface for Filepicker's REST API
 class FilepickerClient
@@ -34,6 +35,7 @@ class FilepickerClient
   # @param options [Hash] Options for generating the desired signature
   # @return [Hash] The policy generated with the encoded policy and signature for use in Filepicker requests
   def sign(options={})
+    options = convert_hash(options)
     options[:expiration_start] ||= Time.now
     options[:expiry] ||= DEFAULT_POLICY_EXPIRY
 
@@ -65,11 +67,11 @@ class FilepickerClient
     # Sign policy using our API secret
     signature = OpenSSL::HMAC.hexdigest('sha256', @api_secret, encoded_policy)
 
-    return {
-      policy: policy,
+    return convert_hash(
+      policy: convert_hash(policy),
       encoded_policy: encoded_policy,
       signature: signature
-    }
+    )
   end
 
   # Get Filepicker URI for the file with the given handle.
@@ -97,10 +99,10 @@ class FilepickerClient
       policy: signage[:encoded_policy]
     )
 
-    return {
+    return convert_hash(
       uri: uri,
       expiry: signage[:policy]['expiry'].to_i
-    }
+    )
   end
 
   # Store the given file at the given storage path through Filepicker.
@@ -111,20 +113,20 @@ class FilepickerClient
     signage = sign(path: path, call: :store)
 
     uri = URI.parse(FP_API_PATH)
-    uri.query = URI.encode_www_form(
+    query_params = {
       key: @api_key,
       signature: signage[:signature],
-      policy: signage[:encoded_policy],
-      path: signage[:policy]['path']
-    )
-
+      policy: signage[:encoded_policy]
+    }
+    query_params[:path] = signage[:policy]['path'] if path
+    uri.query = URI.encode_www_form(query_params)
     resource = get_fp_resource uri
 
     response = resource.post fileUpload: file
 
     if response.code == 200
       response_data = JSON.parse response.body
-      file = FilepickerClientFile.new response_data, self
+      file = FilepickerClientFile.new(response_data, self)
 
       return file
     else
@@ -140,12 +142,13 @@ class FilepickerClient
     signage = sign(path: path, call: :store)
 
     uri = URI.parse(FP_API_PATH)
-    uri.query = URI.encode_www_form(
+    query_params = {
       key: @api_key,
       signature: signage[:signature],
-      policy: signage[:encoded_policy],
-      path: signage[:policy]['path']
-    )
+      policy: signage[:encoded_policy]
+    }
+    query_params[:path] = signage[:policy]['path'] if path
+    uri.query = URI.encode_www_form(query_params)
 
     resource = get_fp_resource uri
 
@@ -161,21 +164,105 @@ class FilepickerClient
     end
   end
 
-  # Get basic information about a file.
-  # @param handle [String] Handle for the file in Filepicker
-  # @return [Hash] Name, size, and MIME type of the file
-  def stat(handle)
-    uri = file_read_uri_and_expiry(handle)[:uri]
+  # Store a converted version of a file under the target storage path.
+  #
+  # For all available options, see Filepicker's [Image Conversion API](https://developers.inkfilepicker.com/docs/web/#inkblob-images).
+  #
+  # @param handle [String] Handle for the original file in Filepicker
+  # @param path [String] Path the file should be organized under in the destination storage
+  # @param options [Hash]
+  # @return [FilepickerClientFile] Object representing the uploaded file in Filepicker
+  def convert_and_store(handle, path=nil, options={})
+    options = convert_hash(options)
+
+    # Build a convert url for the file
+    uri = file_uri(handle)
+    uri.path += "/convert"
+
+    # Sign to allow store of a new file under the target path.
+    # The handle of the file being read is not required.
+    signage = sign(
+      expiry: DEFAULT_POLICY_EXPIRY,
+      path: path,
+      call: ['convert', 'store']
+    )
+
+    # Add key, signature, and policy into the query string along
+    # with the convert options.
+    options = options.merge(
+      key: @api_key,
+      signature: signage[:signature],
+      policy: signage[:encoded_policy],
+      storeLocation: 'S3'
+    )
+    options[:storePath] = signage[:policy]['path'] if path
+    uri.query = URI.encode_www_form(options)
+
     resource = get_fp_resource uri
 
-    response = resource.head
+    response = resource.post({})  # all data in query string already, empty hash is just to allow this call to be made
 
     if response.code == 200
-      return {
-        name: response.headers[:x_file_name].to_s,
-        size: response.headers[:content_length].to_i,
-        mime_type: response.headers[:content_type].to_s
-      }
+      response_data = JSON.parse response.body
+      file = FilepickerClientFile.new response_data, self
+
+      return file
+    else
+      raise FilepickerClientError, "failed to store (code: #{response.code})"
+    end
+  end
+
+  # Get basic information about a file.
+  #
+  # Set any of the following keys to true in the options to enable certain fields in the data retrieved:
+  # * mimetype
+  # * uploaded
+  # * container
+  # * writeable
+  # * filename
+  # * location
+  # * key
+  # * path
+  # * size
+  # * width
+  # * height
+  #
+  # @param handle [String] Handle for the file in Filepicker
+  # @param options [Hash] Options for generating the desired signature
+  # @return [Hash] Name, size, and MIME type of the file
+  def stat(handle, options={})
+    options = convert_hash(options)
+
+    # Build a metadata url for the file
+    # (this call returns more information than a HEAD request against the resource)
+    uri = file_uri(handle)
+    uri.path += "/metadata"
+
+    # Sign to allow store of a new file under the target path.
+    # The handle of the file being read is not required.
+    signage = sign(
+      expiry: DEFAULT_POLICY_EXPIRY,
+      call: 'stat'
+    )
+
+    # Add key, signature, and policy into the query string along
+    # with the metadata options.
+    options = options.merge(
+      key: @api_key,
+      signature: signage[:signature],
+      policy: signage[:encoded_policy]
+    )
+    uri.query = URI.encode_www_form(options)
+
+    resource = get_fp_resource uri
+
+    response = resource.get
+
+    if response.code == 200
+      response_data = JSON.parse(response.body)
+      stats = convert_hash(response_data)
+
+      return stats
     else
       raise FilepickerClientError, "failed to get file stats (code: #{response.code})"
     end
@@ -280,18 +367,22 @@ class FilepickerClient
       ssl_client_cert: @filepicker_cert
     )
   end
+
+  def convert_hash(hash)
+    HashWithIndifferentAccess.new(hash)
+  end
 end
 
 # Filepicker File Container
 class FilepickerClientFile
-  attr_accessor :mime_type, :size, :handle, :store_key, :filename, :client
+  attr_accessor :mimetype, :size, :handle, :store_key, :filename, :client
 
   # Create an object linked to the client to interact with the file in Filepicker
   # @param blob [Hash] Information about the file from Filepicker
   # @param client [FilepickerClient] Client through which actions on this file should be taken
   # @return [FilepickerClientFile]
   def initialize(blob, client)
-    @mime_type = blob['type']
+    @mimetype = blob['type']
     @size = blob['size']
     @handle = URI.parse(blob['url']).path.split('/').last.strip unless blob['url'].nil?
     @store_key = blob['key']
@@ -321,7 +412,7 @@ class FilepickerClientFile
   # @return [Hash] Name, size, and MIME type of the file
   def stat
     updated_info = @client.stat @handle
-    @mime_type = updated_info[:mime_type]
+    @mimetype = updated_info[:mimetype]
     @size = updated_info[:size]
 
     return updated_info
