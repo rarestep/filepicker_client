@@ -59,7 +59,7 @@ class FilepickerClient
     end
 
     # Set expiration for <expiry> seconds from expiration start
-    policy['expiry'] = (options[:expiration_start] + options[:expiry]).to_i.to_s
+    policy['expiry'] = (options[:expiration_start] + options[:expiry]).to_i
 
     # Generate policy in URL safe base64 encoded JSON
     encoded_policy = Base64.urlsafe_encode64(policy.to_json)
